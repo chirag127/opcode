@@ -310,7 +310,7 @@ fn decode_project_path(encoded: &str) -> String {
 /// layouts) without touching the real disk. Paths are plain strings in the
 /// platform's own syntax (`/a/b` or `C:\a\b`).
 trait PathProbe {
-    /// Names of the entries directly inside `dir` (no metadata lookups).
+    /// Names of entries directly inside `dir`, including Windows short-name aliases.
     fn child_names(&self, dir: &str) -> Vec<String>;
     /// Whether `path` is a directory (symlinks are followed).
     fn is_dir(&self, path: &str) -> bool;
@@ -321,18 +321,58 @@ struct RealFs;
 
 impl PathProbe for RealFs {
     fn child_names(&self, dir: &str) -> Vec<String> {
-        match fs::read_dir(dir) {
-            Ok(entries) => entries
-                .flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect(),
-            Err(_) => Vec::new(),
+        let mut names = Vec::new();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    #[cfg(windows)]
+                    if let Some(short_name) = windows_short_name(&entry.path()) {
+                        if short_name != name {
+                            names.push(short_name);
+                        }
+                    }
+                    names.push(name);
+                }
+            }
         }
+        names
     }
 
     fn is_dir(&self, path: &str) -> bool {
         std::path::Path::new(path).is_dir()
     }
+}
+
+#[cfg(windows)]
+fn windows_short_name(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(long_path: *const u16, short_path: *mut u16, size: u32) -> u32;
+    }
+
+    let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if path.contains(&0) {
+        return None;
+    }
+    path.push(0);
+    // read_dir returns long names only; an encoded cwd can instead contain
+    // an existing 8.3 alias such as RUNNER~1. Ask Windows, never invent aliases.
+    let size = unsafe { GetShortPathNameW(path.as_ptr(), std::ptr::null_mut(), 0) };
+    if size == 0 || size > 32_768 {
+        return None;
+    }
+    let mut short = vec![0u16; size as usize];
+    let len = unsafe { GetShortPathNameW(path.as_ptr(), short.as_mut_ptr(), size) };
+    if len == 0 || len >= size {
+        return None;
+    }
+    let short = String::from_utf16(&short[..len as usize]).ok()?;
+    std::path::Path::new(&short)
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
 }
 
 /// Splits a project folder name into `(root, separator, remainder)`.
@@ -2676,6 +2716,17 @@ mod tests {
             .collect()
     }
 
+    fn assert_same_directory(resolved: &str, expected: &std::path::Path) {
+        let resolved = std::path::Path::new(resolved);
+        assert!(resolved.is_dir(), "not an existing directory: {resolved:?}");
+        // Windows can spell the same directory with mixed separators or 8.3
+        // aliases. Canonical identity must match, not the presentation string.
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            expected.canonicalize().unwrap()
+        );
+    }
+
     /// Creates `<temp>/<rel>` on disk and returns (real path, Claude folder name).
     fn make_real_project(temp: &TempDir, rel: &str) -> (String, String) {
         let real = temp.path().join(rel);
@@ -2765,7 +2816,10 @@ mod tests {
         let project_dir = temp.path().join("claude-projects").join(&encoded);
         fs::create_dir_all(&project_dir).unwrap();
 
-        assert_eq!(resolve_project_path(&project_dir, &encoded), real);
+        assert_same_directory(
+            &resolve_project_path(&project_dir, &encoded),
+            std::path::Path::new(&real),
+        );
     }
 
     #[test]
@@ -2782,10 +2836,7 @@ mod tests {
         // Once the real directory appears the next call must find it.
         let real = temp.path().join("later_created");
         fs::create_dir_all(&real).unwrap();
-        assert_eq!(
-            resolve_project_path(&project_dir, &encoded),
-            real.to_string_lossy()
-        );
+        assert_same_directory(&resolve_project_path(&project_dir, &encoded), &real);
     }
 
     #[test]
@@ -2946,6 +2997,44 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_windows_short_name_components() {
+        let fs =
+            FakeFs::new(&[r"C:\Users\RUNNER~1\AppData\Local\Temp\.tmpFixture\user\my-project"]);
+        assert_eq!(
+            resolve_project_dir_name_with(
+                "C--Users-RUNNER-1-AppData-Local-Temp--tmpFixture-user-my-project",
+                &fs,
+            )
+            .as_deref(),
+            Some(r"C:\Users\RUNNER~1\AppData\Local\Temp\.tmpFixture\user\my-project")
+        );
+        assert_eq!(
+            resolve_project_dir_name_with("C--Users-RUNNER-2-AppData", &fs),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_real_fs_resolves_windows_short_name_alias() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project with a long name");
+        fs::create_dir(&project).unwrap();
+        let short_name = windows_short_name(&project).expect("existing directory has a path name");
+        let names = RealFs.child_names(temp.path().to_str().unwrap());
+        assert!(names.iter().any(|name| name == "project with a long name"));
+        assert!(names.contains(&short_name));
+
+        // Volumes without 8.3 names return the long name; do not invent or require
+        // an alias there. On NTFS this exercises the actual alias returned by Windows.
+        let alias = temp.path().join(short_name);
+        let encoded = claude_dir_name(alias.to_str().unwrap());
+        let resolved = resolve_project_dir_name(&encoded).expect("existing project must resolve");
+        assert_same_directory(&resolved, &project);
+        assert!(windows_short_name(&project.join("missing")).is_none());
+    }
+
+    #[test]
     fn test_resolve_windows_unsupported_and_missing_return_none() {
         let fs = FakeFs::new(&[r"C:\Users\x"]);
         // UNC paths (\\server\share) are not supported: no drive letter
@@ -3011,28 +3100,28 @@ mod tests {
     fn test_issue_465_decode_underscore_in_path() {
         let temp_dir = TempDir::new().unwrap();
         let (real, encoded) = make_real_project(&temp_dir, "michal_mikes/projects");
-        assert_eq!(decode_project_path(&encoded), real);
+        assert_same_directory(&decode_project_path(&encoded), std::path::Path::new(&real));
     }
 
     #[test]
     fn test_issue_465_decode_hyphen_in_path() {
         let temp_dir = TempDir::new().unwrap();
         let (real, encoded) = make_real_project(&temp_dir, "user/my-project");
-        assert_eq!(decode_project_path(&encoded), real);
+        assert_same_directory(&decode_project_path(&encoded), std::path::Path::new(&real));
     }
 
     #[test]
     fn test_issue_465_decode_dot_folder_in_path() {
         let temp_dir = TempDir::new().unwrap();
         let (real, encoded) = make_real_project(&temp_dir, "me/.projects/myproject");
-        assert_eq!(decode_project_path(&encoded), real);
+        assert_same_directory(&decode_project_path(&encoded), std::path::Path::new(&real));
     }
 
     #[test]
     fn test_issue_465_decode_mixed_separators_in_path() {
         let temp_dir = TempDir::new().unwrap();
         let (real, encoded) = make_real_project(&temp_dir, "john_doe/.cfg/my-app_v2.0");
-        assert_eq!(decode_project_path(&encoded), real);
+        assert_same_directory(&decode_project_path(&encoded), std::path::Path::new(&real));
     }
 
     /// Baseline timing for the hot path (run with
