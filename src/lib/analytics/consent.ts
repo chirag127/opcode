@@ -24,8 +24,8 @@ export class ConsentManager {
       } else {
         // Initialize with default settings
         this.settings = {
-          enabled: true,
-          hasConsented: true,
+          enabled: false,
+          hasConsented: false,
         };
       }
       
@@ -41,16 +41,17 @@ export class ConsentManager {
       }
       
       return this.settings || {
-        enabled: true,
-        hasConsented: true,
+        enabled: false,
+        hasConsented: false,
       };
     } catch (error) {
       console.error('Failed to initialize consent manager:', error);
-      // Return default settings on error
-      return {
-        enabled: true,
-        hasConsented: true,
+      // Clear previously loaded consent too, so storage failures fail closed.
+      this.settings = {
+        enabled: false,
+        hasConsented: false,
       };
+      return this.settings;
     }
   }
   
@@ -82,8 +83,8 @@ export class ConsentManager {
     
     // Reset settings with new anonymous ID
     this.settings = {
-      enabled: true,
-      hasConsented: true,
+      enabled: false,
+      hasConsented: false,
       userId: this.generateAnonymousId(),
       sessionId: this.generateSessionId(),
     };
@@ -100,7 +101,7 @@ export class ConsentManager {
   }
   
   isEnabled(): boolean {
-    return this.settings?.enabled || false;
+    return this.settings?.enabled === true && this.settings?.hasConsented === true;
   }
   
   getUserId(): string {

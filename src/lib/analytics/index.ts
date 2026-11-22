@@ -1,6 +1,7 @@
 import posthog from 'posthog-js';
 import { ConsentManager } from './consent';
 import { sanitizers } from './events';
+import { resourceMonitor } from './resourceMonitor';
 import type { 
   AnalyticsConfig, 
   AnalyticsEvent, 
@@ -51,8 +52,9 @@ class AnalyticsService {
       const settings = await this.consentManager.initialize();
       
       // Only initialize PostHog if user has consented
-      if (settings.hasConsented && settings.enabled) {
+      if (this.consentManager.isEnabled()) {
         this.initializePostHog(settings);
+        resourceMonitor.startMonitoring(120000);
       }
       
       // Start event queue flush interval
@@ -107,19 +109,23 @@ class AnalyticsService {
   async enable(): Promise<void> {
     await this.consentManager.grantConsent();
     const settings = this.consentManager.getSettings();
-    if (settings) {
+    if (settings && this.consentManager.isEnabled()) {
       this.initializePostHog(settings);
+      resourceMonitor.startMonitoring(120000);
     }
   }
-  
+
   async disable(): Promise<void> {
     await this.consentManager.revokeConsent();
+    resourceMonitor.stopMonitoring();
+    this.eventQueue = [];
     if (typeof posthog !== 'undefined' && posthog.opt_out_capturing) {
       posthog.opt_out_capturing();
     }
   }
   
   async deleteAllData(): Promise<void> {
+    await this.disable();
     await this.consentManager.deleteAllData();
     if (typeof posthog !== 'undefined' && posthog.reset) {
       posthog.reset();
@@ -128,7 +134,8 @@ class AnalyticsService {
   
   setScreen(screenName: string): void {
     this.currentScreen = screenName;
-    
+    if (!this.consentManager.isEnabled()) return;
+
     // Track screen view in PostHog
     if (typeof posthog !== 'undefined' && typeof posthog.capture === 'function') {
       posthog.capture('$screen', {
