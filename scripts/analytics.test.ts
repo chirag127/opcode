@@ -1,15 +1,24 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { ReactElement, ReactNode } from 'react';
 
+let sdkInitialized = false;
+let sdkOptedOut = false;
+const capturedEvents: string[] = [];
+// posthog-js 1.258.3 ignores repeated init() and reset() clears SDK consent.
 const sdk = {
   init: mock((_key: string, options: { loaded?: (client: typeof sdk) => void }) => {
+    if (sdkInitialized) return;
+    sdkInitialized = true;
     options.loaded?.(sdk);
   }),
-  capture: mock(() => {}),
+  capture: mock((event: string) => {
+    if (sdkInitialized && !sdkOptedOut) capturedEvents.push(event);
+  }),
   identify: mock(() => {}),
-  opt_in_capturing: mock(() => {}),
-  opt_out_capturing: mock(() => {}),
-  reset: mock(() => {}),
+  opt_in_capturing: mock(() => { sdkOptedOut = false; }),
+  opt_out_capturing: mock(() => { sdkOptedOut = true; }),
+  has_opted_out_capturing: mock(() => sdkOptedOut),
+  reset: mock(() => { sdkOptedOut = false; }),
 };
 mock.module('posthog-js', () => ({ default: sdk }));
 
@@ -93,6 +102,9 @@ beforeEach(() => {
   // Keep singleton reset in tests, not as a production-only testing API.
   (analytics as unknown as { initialized: boolean }).initialized = false;
   Object.values(sdk).forEach(method => method.mockClear());
+  sdkInitialized = false;
+  sdkOptedOut = false;
+  capturedEvents.length = 0;
   renderRoot.mockClear();
 });
 
@@ -170,6 +182,8 @@ describe('analytics startup and consent transitions', () => {
 
     await analytics.enable();
     expect(monitoringIntervals()).toBe(1);
+    analytics.track('re_enabled_event');
+    expect(capturedEvents).toContain('re_enabled_event');
   });
 
   test('persisted explicit consent starts monitoring during initialization', async () => {
@@ -185,8 +199,10 @@ describe('analytics startup and consent transitions', () => {
     await analytics.deleteAllData();
     expect(analytics.isEnabled()).toBe(false);
     expect(analytics.hasConsented()).toBe(false);
-    expect(sdk.opt_out_capturing).toHaveBeenCalledTimes(1);
     expect(sdk.reset).toHaveBeenCalledTimes(1);
     expect(monitoringIntervals()).toBe(0);
+    capturedEvents.length = 0;
+    sdk.capture('sdk_event_after_deletion');
+    expect(capturedEvents).toEqual([]);
   });
 });

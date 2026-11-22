@@ -111,6 +111,8 @@ class AnalyticsService {
     const settings = this.consentManager.getSettings();
     if (settings && this.consentManager.isEnabled()) {
       this.initializePostHog(settings);
+      // Reinitializing PostHog is a no-op, so its loaded callback cannot restore consent.
+      if (posthog.has_opted_out_capturing()) posthog.opt_in_capturing();
       resourceMonitor.startMonitoring(120000);
     }
   }
@@ -129,6 +131,8 @@ class AnalyticsService {
     await this.consentManager.deleteAllData();
     if (typeof posthog !== 'undefined' && posthog.reset) {
       posthog.reset();
+      // reset() clears the SDK's opt-out marker as well as its identity.
+      posthog.opt_out_capturing();
     }
   }
   
